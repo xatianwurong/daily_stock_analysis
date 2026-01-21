@@ -590,6 +590,9 @@ class GeminiAnalyzer:
                 
                 if is_rate_limit:
                     logger.warning(f"[OpenAI] API 限流，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    logger.warning("[OpenAI] 程序将休眠 60 秒以避免持续限流...")
+                    import time
+                    time.sleep(60)
                 else:
                     logger.warning(f"[OpenAI] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
                 
@@ -656,6 +659,9 @@ class GeminiAnalyzer:
                 
                 if is_rate_limit:
                     logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    logger.warning("[Gemini] 程序将休眠 60 秒以避免持续限流...")
+                    import time
+                    time.sleep(60)
                     
                     # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
                     if attempt >= max_retries // 2 and not tried_fallback:
