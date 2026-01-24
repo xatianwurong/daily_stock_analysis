@@ -698,16 +698,11 @@ class GeminiAnalyzer:
                 if is_rate_limit:
                     logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
                     logger.warning("[Gemini] 程序将休眠 60 秒以避免持续限流...")
-                    try:
-                        import time
-                        start_sleep = time.time()
-                        logger.warning(f"[Gemini] 开始休眠，当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                        time.sleep(60)
-                        end_sleep = time.time()
-                        logger.warning(f"[Gemini] 结束休眠，当前时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                        logger.warning(f"[Gemini] 休眠完成，实际休眠时间: {end_sleep - start_sleep:.2f} 秒")
-                    except Exception as sleep_error:
-                        logger.error(f"[Gemini] 休眠过程中发生异常: {sleep_error}")
+                    import time
+                    start_sleep = time.time()
+                    time.sleep(60)
+                    end_sleep = time.time()
+                    logger.warning(f"[Gemini] 休眠完成，实际休眠时间: {end_sleep - start_sleep:.2f} 秒")
                     
                     # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
                     if attempt >= max_retries // 2 and not tried_fallback:
