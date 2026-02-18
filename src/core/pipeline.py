@@ -83,6 +83,7 @@ class StockAnalysisPipeline:
             tavily_keys=self.config.tavily_api_keys,
             brave_keys=self.config.brave_api_keys,
             serpapi_keys=self.config.serpapi_keys,
+            news_max_age_days=self.config.news_max_age_days,
         )
         
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
@@ -147,7 +148,7 @@ class StockAnalysisPipeline:
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
     
-    def analyze_stock(self, code: str, report_type: ReportType) -> Optional[AnalysisResult]:
+    def analyze_stock(self, code: str, report_type: ReportType, query_id: str) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
         
@@ -160,6 +161,7 @@ class StockAnalysisPipeline:
         6. 调用 AI 进行综合分析
         
         Args:
+            query_id: 查询链路关联 id
             code: 股票代码
             report_type: 报告类型
             
@@ -244,7 +246,7 @@ class StockAnalysisPipeline:
 
                     # 保存新闻情报到数据库（用于后续复盘与查询）
                     try:
-                        query_context = self._build_query_context()
+                        query_context = self._build_query_context(query_id=query_id)
                         for dim_name, response in intel_results.items():
                             if response and response.success and response.results:
                                 self.db.save_news_intel(
@@ -294,13 +296,8 @@ class StockAnalysisPipeline:
                 result.change_pct = realtime_data.get('change_pct')
 
             # Step 8: 保存分析历史记录
-            # Fix #281/#298: generate a unique query_id per stock so each
-            # history detail page shows its own analysis result instead of
-            # reusing the batch-level id which caused all stocks to resolve
-            # to the same detail record.
             if result:
                 try:
-                    per_stock_query_id = uuid.uuid4().hex
                     context_snapshot = self._build_context_snapshot(
                         enhanced_context=enhanced_context,
                         news_content=news_context,
@@ -309,7 +306,7 @@ class StockAnalysisPipeline:
                     )
                     self.db.save_analysis_history(
                         result=result,
-                        query_id=per_stock_query_id,
+                        query_id=query_id,
                         report_type=report_type.value,
                         news_content=news_context,
                         context_snapshot=context_snapshot,
@@ -485,12 +482,14 @@ class StockAnalysisPipeline:
             return "web"
         return "system"
 
-    def _build_query_context(self) -> Dict[str, str]:
+    def _build_query_context(self, query_id: Optional[str] = None) -> Dict[str, str]:
         """
         生成用户查询关联信息
         """
+        effective_query_id = query_id or self.query_id or ""
+
         context: Dict[str, str] = {
-            "query_id": self.query_id or "",
+            "query_id": effective_query_id,
             "query_source": self.query_source or "",
         }
 
@@ -511,7 +510,8 @@ class StockAnalysisPipeline:
         code: str,
         skip_analysis: bool = False,
         single_stock_notify: bool = False,
-        report_type: ReportType = ReportType.SIMPLE
+        report_type: ReportType = ReportType.SIMPLE,
+        analysis_query_id: Optional[str] = None,
     ) -> Optional[AnalysisResult]:
         """
         处理单只股票的完整流程
@@ -525,6 +525,7 @@ class StockAnalysisPipeline:
         此方法会被线程池调用，需要处理好异常
 
         Args:
+            analysis_query_id: 查询链路关联 id
             code: 股票代码
             skip_analysis: 是否跳过 AI 分析
             single_stock_notify: 是否启用单股推送模式（每分析完一只立即推送）
@@ -548,7 +549,8 @@ class StockAnalysisPipeline:
                 logger.info(f"[{code}] 跳过 AI 分析（dry-run 模式）")
                 return None
             
-            result = self.analyze_stock(code, report_type)
+            effective_query_id = analysis_query_id or self.query_id or uuid.uuid4().hex
+            result = self.analyze_stock(code, report_type, query_id=effective_query_id)
             
             if result:
                 logger.info(
@@ -584,25 +586,27 @@ class StockAnalysisPipeline:
             return None
     
     def run(
-        self, 
+        self,
         stock_codes: Optional[List[str]] = None,
         dry_run: bool = False,
-        send_notification: bool = True
+        send_notification: bool = True,
+        merge_notification: bool = False
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
-        
+
         流程：
         1. 获取待分析的股票列表
         2. 使用线程池并发处理
         3. 收集分析结果
         4. 发送通知
-        
+
         Args:
             stock_codes: 股票代码列表（可选，默认使用配置中的自选股）
             dry_run: 是否仅获取数据不分析
             send_notification: 是否发送推送通知
-            
+            merge_notification: 是否合并推送（跳过本次推送，由 main 层合并个股+大盘后统一发送，Issue #190）
+
         Returns:
             分析结果列表
         """
@@ -651,7 +655,8 @@ class StockAnalysisPipeline:
                     code,
                     skip_analysis=dry_run,
                     single_stock_notify=single_stock_notify and send_notification,
-                    report_type=report_type  # Issue #119: 传递报告类型
+                    report_type=report_type,  # Issue #119: 传递报告类型
+                    analysis_query_id=uuid.uuid4().hex,
                 ): code
                 for code in stock_codes
             }
@@ -692,6 +697,10 @@ class StockAnalysisPipeline:
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
+                self._send_notifications(results, skip_push=True)
+            elif merge_notification:
+                # 合并模式（Issue #190）：仅保存，不推送，由 main 层合并个股+大盘后统一发送
+                logger.info("合并推送模式：跳过本次推送，将在个股+大盘复盘后统一发送")
                 self._send_notifications(results, skip_push=True)
             else:
                 self._send_notifications(results)
