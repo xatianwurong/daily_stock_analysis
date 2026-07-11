@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -19,7 +20,25 @@ from src.agent.events import (
     parse_event_alert_rules,
     validate_event_alert_rule,
 )
+from data_provider.base import normalize_stock_code
+from data_provider.us_index_mapping import is_us_index_code
+from src.analysis_context_pack_overview import (
+    ANALYSIS_CONTEXT_PACK_OVERVIEW_KEY,
+    extract_analysis_context_pack_overview,
+)
+from src.core.trading_calendar import build_market_phase_context, get_market_for_stock
+from src.market_phase_summary import (
+    format_public_phase_pack_excerpt,
+    render_market_phase_summary,
+)
 from src.services.alert_service import AlertService
+from src.services.decision_signal_service import DecisionSignalService
+from src.services.decision_signal_summary import (
+    format_decision_signal_excerpt,
+    summarize_decision_signal,
+)
+from src.services.history_service import HistoryService
+from src.services.market_light_service import normalize_market_alert_region
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +58,8 @@ class RuntimeAlertRule:
     source: str
     severity: Optional[str] = None
     cooldown_policy: Optional[Dict[str, Any]] = None
+    effective_target: Optional[str] = None
+    display_target: Optional[str] = None
 
 
 @dataclass
@@ -62,17 +83,20 @@ class AlertWorker:
         *,
         config_provider: Optional[Callable[[], Any]] = None,
         service: Optional[AlertService] = None,
+        decision_signal_service: Optional[DecisionSignalService] = None,
         notifier: Optional[Any] = None,
         now_provider: Optional[Callable[[], float]] = None,
         fingerprint_ttl_seconds: int = ALERT_WORKER_FINGERPRINT_TTL_SECONDS,
     ) -> None:
         self.config_provider = config_provider or self._default_config_provider
         self.service = service or AlertService()
+        self.decision_signal_service = decision_signal_service or DecisionSignalService()
         self.notifier = notifier
         self.now_provider = now_provider or time.time
         self.fingerprint_ttl_seconds = max(1, int(fingerprint_ttl_seconds))
         self._trigger_fingerprints: Dict[str, float] = {}
         self._trigger_fingerprint_ttls: Dict[str, int] = {}
+        self._analysis_visibility_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 
     @staticmethod
     def _default_config_provider():
@@ -117,7 +141,8 @@ class AlertWorker:
             return stats
 
         monitor = EventMonitor()
-        daily_cache: Dict[tuple[str, int], Any] = {}
+        daily_cache: Dict[Any, Any] = {}
+        self._analysis_visibility_cache = {}
         for runtime_rule in runtime_rules:
             stats["evaluated"] += 1
             try:
@@ -136,6 +161,8 @@ class AlertWorker:
                 }
 
             record_status = result.get("record_status")
+            if record_status == "triggered":
+                self._attach_decision_signal_summary_safely(runtime_rule, result)
             if record_status in WRITABLE_TRIGGER_STATUSES:
                 trigger_write = self._record_trigger_safely(runtime_rule, result, record_status)
                 trigger_id = trigger_write.trigger_id
@@ -179,23 +206,28 @@ class AlertWorker:
 
         for row in self.service.repo.list_enabled_rules(limit=ALERT_WORKER_RULE_LIMIT):
             try:
-                rule_data = self.service._serialize_rule_base(row)
-                key = self._semantic_key(
-                    rule_data["target_scope"],
-                    rule_data["target"],
-                    rule_data["alert_type"],
-                    rule_data["parameters"],
-                )
-                runtime_rules.append(
-                    RuntimeAlertRule(
-                        key=key,
-                        rule=self.service._to_runtime_rule(row, rule_data),
-                        source="db",
-                        severity=rule_data.get("severity"),
-                        cooldown_policy=rule_data.get("cooldown_policy"),
+                cooldown_policy = self.service._load_json(row.cooldown_policy, default=None)
+                for payload in self.service.build_runtime_payloads(row, config=config, include_overflow_payload=False):
+                    if len(runtime_rules) >= ALERT_WORKER_RULE_LIMIT:
+                        logger.warning(
+                            "[AlertWorker] Runtime rule limit reached at %s; skipping remaining expanded rules",
+                            ALERT_WORKER_RULE_LIMIT,
+                        )
+                        break
+                    runtime_rules.append(
+                        RuntimeAlertRule(
+                            key=payload.key,
+                            rule=payload.rule,
+                            source="db",
+                            severity=row.severity,
+                            cooldown_policy=cooldown_policy,
+                            effective_target=payload.effective_target,
+                            display_target=payload.display_target,
+                        )
                     )
-                )
-                seen_keys.add(key)
+                    seen_keys.add(payload.key)
+                if len(runtime_rules) >= ALERT_WORKER_RULE_LIMIT:
+                    break
             except Exception as exc:
                 logger.warning("[AlertWorker] Skip invalid persisted alert rule %s: %s", getattr(row, "id", "?"), exc)
 
@@ -265,14 +297,14 @@ class AlertWorker:
 
         fields = {
             "rule_id": rule_id,
-            "target": runtime_rule.rule.stock_code,
+            "target": self._effective_target(runtime_rule),
             "observed_value": self._optional_float(result.get("observed_value")),
             "threshold": self._optional_float(result.get("threshold")),
             "reason": result.get("reason") or result.get("message"),
             "data_source": result.get("data_source"),
             "data_timestamp": result.get("data_timestamp"),
             "status": status,
-            "diagnostics": self._diagnostics_for_status(status, result),
+            "diagnostics": self._diagnostics_for_status(status, result, runtime_rule),
         }
         if self._should_deduplicate_trigger(runtime_rule, fields):
             row, created = self.service.repo.create_trigger_if_absent(fields)
@@ -293,7 +325,7 @@ class AlertWorker:
         except Exception as exc:
             logger.warning(
                 "[AlertWorker] Failed to record alert trigger for %s: %s",
-                getattr(runtime_rule.rule, "stock_code", "?"),
+                self._display_target(runtime_rule),
                 self.service._sanitize_text(str(exc) or "trigger write failed"),
             )
             return TriggerWriteResult()
@@ -316,11 +348,256 @@ class AlertWorker:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _diagnostics_for_status(status: str, result: Dict[str, Any]) -> Optional[str]:
+    def _diagnostics_for_status(
+        self,
+        status: str,
+        result: Dict[str, Any],
+        runtime_rule: RuntimeAlertRule,
+    ) -> Optional[str]:
         if status == "triggered":
-            return None
+            payload = self._diagnostics_payload(result.get("diagnostics"))
+            payload["analysis_visibility"] = self._build_analysis_visibility(runtime_rule, result)
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return result.get("message") or result.get("reason")
+
+    @staticmethod
+    def _diagnostics_payload(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {"legacy_diagnostics": value}
+            return dict(parsed) if isinstance(parsed, dict) else {"legacy_diagnostics": value}
+        return {}
+
+    def _attach_decision_signal_summary_safely(
+        self,
+        runtime_rule: RuntimeAlertRule,
+        result: Dict[str, Any],
+    ) -> None:
+        try:
+            summary = self._resolve_decision_signal_summary(runtime_rule, result)
+            if not summary:
+                return
+            payload = self._diagnostics_payload(result.get("diagnostics"))
+            payload["decision_signal_summary"] = summary
+            result["diagnostics"] = payload
+        except Exception as exc:
+            logger.debug(
+                "[AlertWorker] decision signal summary unavailable for %s: %s",
+                self._display_target(runtime_rule),
+                self.service._sanitize_text(str(exc) or "decision signal summary failed"),
+            )
+
+    def _resolve_decision_signal_summary(
+        self,
+        runtime_rule: RuntimeAlertRule,
+        result: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        identity = self._symbol_identity_for_decision_signal(runtime_rule)
+        if identity is None:
+            return None
+        stock_code, market = identity
+        latest = self.decision_signal_service.get_latest_active(
+            stock_code=stock_code,
+            market=market,
+            limit=1,
+        )
+        items = latest.get("items") if isinstance(latest, dict) else None
+        if items:
+            return summarize_decision_signal(items[0])
+
+        created = self.decision_signal_service.create_signal(
+            self._alert_decision_signal_payload(
+                runtime_rule,
+                result,
+                stock_code=stock_code,
+                market=market,
+            )
+        )
+        item = created.get("item") if isinstance(created, dict) else None
+        return summarize_decision_signal(item)
+
+    def _symbol_identity_for_decision_signal(self, runtime_rule: RuntimeAlertRule) -> Optional[Tuple[str, str]]:
+        rule = getattr(runtime_rule, "rule", runtime_rule)
+        metadata = getattr(rule, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        target_scope = str(
+            getattr(rule, "target_scope", None)
+            or metadata.get("target_scope")
+            or ""
+        ).strip()
+        if target_scope in {"market", "portfolio_account"}:
+            return None
+        target = str(
+            metadata.get("effective_target")
+            or runtime_rule.effective_target
+            or getattr(rule, "stock_code", "")
+            or ""
+        ).strip()
+        if not target or ":" in target:
+            return None
+        stock_code = normalize_stock_code(target)
+        if is_us_index_code(stock_code):
+            return None
+        market = get_market_for_stock(stock_code)
+        if market not in {"cn", "hk", "us"}:
+            return None
+        return stock_code, market
+
+    def _alert_decision_signal_payload(
+        self,
+        runtime_rule: RuntimeAlertRule,
+        result: Dict[str, Any],
+        *,
+        stock_code: str,
+        market: str,
+    ) -> Dict[str, Any]:
+        rule = getattr(runtime_rule, "rule", runtime_rule)
+        metadata = getattr(rule, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        alert_type = self._public_alert_type(getattr(rule, "alert_type", None) or result.get("alert_type"))
+        key_hash = hashlib.sha1(str(runtime_rule.key or "").encode("utf-8")).hexdigest()
+        return {
+            "stock_code": stock_code,
+            "stock_name": getattr(rule, "stock_name", None),
+            "market": market,
+            "source_type": "alert",
+            "source_agent": "alert_worker",
+            "trace_id": f"alert-rule-{key_hash[:32]}",
+            "trigger_source": "alert",
+            "action": "alert",
+            "reason": result.get("reason") or result.get("message") or getattr(rule, "description", None),
+            "watch_conditions": self._alert_watch_conditions(runtime_rule, result, alert_type),
+            "risk_summary": self._alert_risk_summary(runtime_rule, result),
+            "metadata": {
+                "rule_id": self.service._runtime_rule_id(rule),
+                "alert_type": alert_type,
+                "severity": runtime_rule.severity,
+                "observed_value": result.get("observed_value"),
+                "threshold": result.get("threshold"),
+                "data_source": result.get("data_source"),
+                "data_timestamp": self._iso_or_text(result.get("data_timestamp")),
+                "rule_key_hash": key_hash,
+            },
+        }
+
+    @staticmethod
+    def _public_alert_type(value: Any) -> str:
+        raw = getattr(value, "value", value)
+        return str(raw or "").strip()[:64]
+
+    def _alert_watch_conditions(
+        self,
+        runtime_rule: RuntimeAlertRule,
+        result: Dict[str, Any],
+        alert_type: str,
+    ) -> str:
+        threshold = result.get("threshold")
+        observed = result.get("observed_value")
+        target = self._display_target(runtime_rule)
+        parts = [part for part in (target, alert_type) if part]
+        if threshold not in (None, ""):
+            parts.append(f"threshold={threshold}")
+        if observed not in (None, ""):
+            parts.append(f"observed={observed}")
+        return " | ".join(str(part) for part in parts)
+
+    def _alert_risk_summary(self, runtime_rule: RuntimeAlertRule, result: Dict[str, Any]) -> str:
+        severity = str(runtime_rule.severity or "warning")
+        reason = result.get("reason") or result.get("message") or "Alert triggered"
+        return f"{severity}: {reason}"
+
+    @staticmethod
+    def _iso_or_text(value: Any) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
+    def _build_analysis_visibility(
+        self,
+        runtime_rule: RuntimeAlertRule,
+        result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        phase_summary = self._alert_market_phase_summary(runtime_rule)
+        overview = self._evaluator_pack_overview(result)
+        source = "evaluator_snapshot" if overview is not None else None
+        if overview is None:
+            overview = self._recent_history_pack_overview(runtime_rule)
+            if overview is not None:
+                source = "analysis_history_snapshot"
+        return {
+            "market_phase_summary": phase_summary,
+            "analysis_context_pack_overview": overview,
+            "source": source or "alert_trigger_market_context",
+        }
+
+    def _alert_market_phase_summary(self, runtime_rule: RuntimeAlertRule) -> Optional[Dict[str, Any]]:
+        try:
+            rule = getattr(runtime_rule, "rule", runtime_rule)
+            target_scope = str(getattr(rule, "target_scope", "") or "")
+            if target_scope == "market":
+                market = normalize_market_alert_region(getattr(rule, "target", self._effective_target(runtime_rule)))
+            elif target_scope in {"portfolio_account"}:
+                market = None
+            else:
+                market = get_market_for_stock(normalize_stock_code(self._effective_target(runtime_rule)))
+            context = build_market_phase_context(
+                market=market,
+                trigger_source="alert",
+                analysis_phase="auto",
+            )
+            payload = context.to_dict() if hasattr(context, "to_dict") else context
+            return render_market_phase_summary(payload)
+        except Exception as exc:
+            logger.debug("[AlertWorker] phase summary unavailable: %s", exc)
+            return None
+
+    @staticmethod
+    def _evaluator_pack_overview(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        overview = result.get("analysis_context_pack_overview")
+        if overview is None:
+            diagnostics = result.get("diagnostics")
+            if isinstance(diagnostics, str):
+                try:
+                    diagnostics = json.loads(diagnostics)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    diagnostics = None
+            if isinstance(diagnostics, dict):
+                overview = diagnostics.get("analysis_context_pack_overview")
+        return extract_analysis_context_pack_overview({ANALYSIS_CONTEXT_PACK_OVERVIEW_KEY: overview})
+
+    def _recent_history_pack_overview(self, runtime_rule: RuntimeAlertRule) -> Optional[Dict[str, Any]]:
+        rule = getattr(runtime_rule, "rule", runtime_rule)
+        target_scope = str(getattr(rule, "target_scope", "") or "")
+        if target_scope in {"market", "portfolio_account"}:
+            return None
+        target = self._effective_target(runtime_rule)
+        if not target or target == "?":
+            return None
+        cache_key = str(target).upper()
+        if cache_key in self._analysis_visibility_cache:
+            return self._analysis_visibility_cache[cache_key]
+        overview: Optional[Dict[str, Any]] = None
+        try:
+            candidates = HistoryService._history_code_filter_candidates(target)
+            records: List[Any] = []
+            for candidate in candidates:
+                records.extend(self.service.db.get_analysis_history(code=candidate, days=30, limit=1))
+            records = sorted(records, key=lambda item: getattr(item, "created_at", None) or datetime.min, reverse=True)
+            if records:
+                overview = extract_analysis_context_pack_overview(getattr(records[0], "context_snapshot", None))
+        except Exception as exc:
+            logger.debug("[AlertWorker] recent history overview unavailable for %s: %s", target, exc)
+            overview = None
+        self._analysis_visibility_cache[cache_key] = overview
+        return overview
 
     def _should_notify(self, rule_key: str, *, ttl_seconds: Optional[int] = None) -> bool:
         now = self.now_provider()
@@ -361,8 +638,22 @@ class AlertWorker:
         from src.notification import NotificationBuilder, NotificationService
 
         notification_service = self.notifier or NotificationService()
-        title = f"Event Alert | {runtime_rule.rule.stock_code}"
+        title = f"Event Alert | {self._display_target(runtime_rule)}"
         content = result.get("reason") or result.get("message") or runtime_rule.rule.description or "Alert triggered"
+        diagnostics = self._diagnostics_payload(result.get("diagnostics"))
+        visibility = diagnostics.get("analysis_visibility") if isinstance(diagnostics.get("analysis_visibility"), dict) else None
+        if visibility is None:
+            visibility = self._build_analysis_visibility(runtime_rule, result)
+        excerpt = format_public_phase_pack_excerpt(
+            visibility.get("market_phase_summary"),
+            visibility.get("analysis_context_pack_overview"),
+            source=visibility.get("source"),
+        )
+        if excerpt:
+            content = f"{content}\n\n{excerpt}"
+        signal_excerpt = format_decision_signal_excerpt(diagnostics.get("decision_signal_summary"))
+        if signal_excerpt:
+            content = f"{content}\n\n{signal_excerpt}"
         alert_text = NotificationBuilder.build_simple_alert(title=title, content=content, alert_type="warning")
 
         return notification_service.send_with_results(alert_text, route_type="alert")
@@ -376,7 +667,7 @@ class AlertWorker:
             sanitized = self.service._sanitize_text(str(exc) or "notification failed")
             logger.warning(
                 "[AlertWorker] Failed to send alert notification for %s: %s",
-                getattr(runtime_rule.rule, "stock_code", "?"),
+                self._display_target(runtime_rule),
                 sanitized,
             )
             return NotificationDispatchResult(
@@ -487,14 +778,14 @@ class AlertWorker:
         try:
             cooldown = self.service.repo.get_active_cooldown(
                 rule_id=rule_id,
-                target=runtime_rule.rule.stock_code,
+                target=self._effective_target(runtime_rule),
                 severity=runtime_rule.severity,
                 now=now_dt,
             )
         except Exception as exc:
             logger.warning(
                 "[AlertWorker] Failed to read alert cooldown for %s: %s",
-                getattr(runtime_rule.rule, "stock_code", "?"),
+                self._display_target(runtime_rule),
                 self.service._sanitize_text(str(exc) or "cooldown read failed"),
             )
             fallback_key = self._db_cooldown_fallback_key(runtime_rule.key)
@@ -570,7 +861,7 @@ class AlertWorker:
             self.service.repo.upsert_cooldown(
                 rule_id=rule_id,
                 rule_key=runtime_rule.key,
-                target=runtime_rule.rule.stock_code,
+                target=self._effective_target(runtime_rule),
                 severity=runtime_rule.severity,
                 last_triggered_at=now_dt,
                 cooldown_until=now_dt + timedelta(seconds=cooldown_seconds),
@@ -579,9 +870,17 @@ class AlertWorker:
         except Exception as exc:
             logger.warning(
                 "[AlertWorker] Failed to update alert cooldown for %s: %s",
-                getattr(runtime_rule.rule, "stock_code", "?"),
+                self._display_target(runtime_rule),
                 self.service._sanitize_text(str(exc) or "cooldown write failed"),
             )
+
+    @staticmethod
+    def _effective_target(runtime_rule: RuntimeAlertRule) -> str:
+        return str(runtime_rule.effective_target or getattr(runtime_rule.rule, "stock_code", "") or "?")
+
+    @staticmethod
+    def _display_target(runtime_rule: RuntimeAlertRule) -> str:
+        return str(runtime_rule.display_target or runtime_rule.effective_target or getattr(runtime_rule.rule, "stock_code", "") or "?")
 
     @staticmethod
     def _cooldown_seconds(runtime_rule: RuntimeAlertRule) -> int:
