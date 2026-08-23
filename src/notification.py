@@ -26,7 +26,6 @@ from enum import Enum
 from src.config import Config, get_config
 from src.enums import ReportType
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
-from src.services.decision_signal_summary import format_decision_signal_excerpt
 from src.notification_routing import (
     get_notification_route_config,
     split_notification_route_channels,
@@ -45,8 +44,16 @@ from src.report_language import (
     get_chip_unavailable_reason,
     is_chip_structure_unavailable,
     localize_chip_health,
+    localize_conflict_severity,
+    localize_consensus_level,
+    localize_strategy_signal,
+    localize_strategy_skill,
+    localize_strategy_conflict_description,
+    localize_strategy_synthesis_summary,
     localize_trend_prediction,
     normalize_report_language,
+    normalize_strategy_synthesis_payload,
+    strategy_invalid_opinion_count,
 )
 from src.schemas.decision_action import (
     display_action_fields_for_result,
@@ -55,6 +62,7 @@ from src.schemas.decision_action import (
 )
 from bot.models import BotMessage
 from src.utils.sanitize import sanitize_diagnostic_text
+from src.formatters import strip_hidden_markdown_metadata
 from src.utils.data_processing import (
     signal_attribution_has_content,
     signal_attribution_weight_items,
@@ -101,6 +109,74 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str:
+    none_text = get_report_labels(report_language).get("none_label", "None")
+    if not isinstance(items, list):
+        return none_text
+    formatted: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        skill_id = str(item.get("skill_id") or "").strip()
+        signal = str(item.get("signal") or "").strip()
+        confidence = item.get("confidence")
+        if not skill_id:
+            continue
+        suffix = f"/{localize_strategy_signal(signal, report_language)}" if signal else ""
+        if isinstance(confidence, (int, float)):
+            suffix += f"/{confidence:.0%}"
+        formatted.append(f"{localize_strategy_skill(skill_id, report_language)}{suffix}")
+    return "、".join(formatted) if formatted else none_text
+
+
+def _append_strategy_synthesis_block(lines: List[str], strategy_synthesis: Any, labels: Dict[str, str], report_language: str) -> None:
+    strategy_synthesis = normalize_strategy_synthesis_payload(strategy_synthesis)
+    if not strategy_synthesis:
+        return
+    confidence = strategy_synthesis.get("confidence")
+    confidence_text = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "N/A"
+    lines.extend([
+        f"### 🧩 {labels['strategy_synthesis_heading']}",
+        "",
+        (
+            f"- {labels['strategy_final_signal_label']}: "
+            f"{localize_strategy_signal(strategy_synthesis.get('final_signal', 'N/A'), report_language)} | "
+            f"{labels['strategy_consensus_level_label']}: "
+            f"{localize_consensus_level(strategy_synthesis.get('consensus_level', 'N/A'), report_language)} | "
+            f"{labels['strategy_conflict_label']}: "
+            f"{localize_conflict_severity(strategy_synthesis.get('conflict_severity', 'none'), report_language)} "
+            f"({strategy_synthesis.get('conflict_count', 0)}) | "
+            f"{labels['strategy_confidence_label']}: {confidence_text}"
+        ),
+    ])
+    summary = localize_strategy_synthesis_summary(strategy_synthesis, report_language)
+    if summary:
+        lines.append(f"- {labels['strategy_summary_label']}: {summary}")
+    lines.append(
+        f"- {labels['strategy_supporting_skills_label']}: "
+        f"{_format_strategy_skill_items(strategy_synthesis.get('supporting_skills'), report_language)}"
+    )
+    lines.append(
+        f"- {labels['strategy_opposing_skills_label']}: "
+        f"{_format_strategy_skill_items(strategy_synthesis.get('opposing_skills'), report_language)}"
+    )
+    invalid_opinion_count = strategy_invalid_opinion_count(strategy_synthesis)
+    if invalid_opinion_count:
+        invalid_label = labels.get("strategy_invalid_opinions_label", "")
+        if invalid_label:
+            lines.append(f"- {invalid_label.format(count=invalid_opinion_count)}")
+    for conflict in (strategy_synthesis.get("conflicts") or [])[:3]:
+        if isinstance(conflict, dict) and conflict.get("conflict_type"):
+            participants = conflict.get("participants") or []
+            participant_text = "、".join(localize_strategy_skill(participant, report_language) for participant in participants)
+            suffix = f"（{participant_text}）" if participant_text else ""
+            lines.append(
+                f"- {localize_conflict_severity(conflict.get('severity', 'medium'), report_language)}: "
+                f"{localize_strategy_conflict_description(conflict.get('conflict_type'), report_language)}{suffix}"
+            )
+    lines.append("")
 
 if TYPE_CHECKING:
     from src.analyzer import AnalysisResult
@@ -334,6 +410,17 @@ class NotificationService(
         self._history_compare_cache[cache_key] = history_by_code
         return {"history_by_code": history_by_code}
 
+    @staticmethod
+    def _empty_news_disclosure(result: "AnalysisResult", language: str = "zh") -> Optional[str]:
+        """新闻检索未执行或零命中时返回对应披露文案。
+
+        判定与文案由 src/services/empty_news 统一持有；字符串拼接渲染器与模板
+        渲染链路共用同一实现，避免同一份分析结果在部分渠道披露、另一些渠道沉默。
+        """
+        from src.services.empty_news import empty_news_disclosure
+
+        return empty_news_disclosure(result, language)
+
     def generate_aggregate_report(
         self,
         results: List[AnalysisResult],
@@ -361,12 +448,6 @@ class NotificationService(
             getattr(result, "market_phase_summary", None),
             getattr(result, "analysis_context_pack_overview", None),
             source=getattr(result, "analysis_visibility_source", None) or "evaluator_snapshot",
-            report_language=report_language,
-        )
-
-    def _decision_signal_excerpt(self, result: AnalysisResult, report_language: str) -> str:
-        return format_decision_signal_excerpt(
-            getattr(result, "decision_signal_summary", None),
             report_language=report_language,
         )
 
@@ -664,7 +745,8 @@ class NotificationService(
         feishu_info = self._extract_feishu_reply_info()
         if feishu_info:
             try:
-                if self._send_feishu_stream_reply(feishu_info["chat_id"], content):
+                sanitized_content = strip_hidden_markdown_metadata(content).strip()
+                if self._send_feishu_stream_reply(feishu_info["chat_id"], sanitized_content):
                     logger.info("已通过飞书会话（Stream）推送报告")
                     success = True
                 else:
@@ -718,6 +800,7 @@ class NotificationService(
 
             # 飞书文本消息有长度限制，需要分批发送
             max_bytes = getattr(config, 'feishu_max_bytes', 20000)
+            content = strip_hidden_markdown_metadata(content).strip()
             content_bytes = len(content.encode('utf-8'))
 
             if content_bytes > max_bytes:
@@ -866,6 +949,9 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                news_disclosure = self._empty_news_disclosure(r, report_language)
+                if news_disclosure:
+                    report_lines.append(news_disclosure)
         else:
             report_lines.extend([f"## 📈 {labels['report_title']}", ""])
             # 逐个股票的详细分析
@@ -882,9 +968,6 @@ class NotificationService(
                     f"**Confidence：{confidence_stars}**",
                     "",
                 ])
-                signal_excerpt = self._decision_signal_excerpt(result, report_language)
-                if signal_excerpt:
-                    report_lines.extend([signal_excerpt, ""])
                 self._append_market_snapshot(report_lines, result)
 
                 # 核心看点
@@ -962,12 +1045,13 @@ class NotificationService(
                     news_lines.append(f"**市场情绪**：{result.market_sentiment}")
                 if hasattr(result, 'hot_topics') and result.hot_topics:
                     news_lines.append(f"**相关热点**：{result.hot_topics}")
-                if news_lines:
-                    report_lines.extend([
-                        "#### 📰 消息面/情绪面",
-                        *news_lines,
-                        "",
-                    ])
+                news_disclosure = self._empty_news_disclosure(result, report_language)
+                if news_lines or news_disclosure:
+                    report_lines.append("#### 📰 消息面/情绪面")
+                    if news_disclosure:
+                        report_lines.append(news_disclosure)
+                    report_lines.extend(news_lines)
+                    report_lines.append("")
 
                 # 综合分析
                 if result.analysis_summary:
@@ -1234,6 +1318,10 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                if self._report_summary_only:
+                    news_disclosure = self._empty_news_disclosure(r, report_language)
+                    if news_disclosure:
+                        report_lines.append(news_disclosure)
             report_lines.extend([
                 "",
                 "---",
@@ -1253,10 +1341,6 @@ class NotificationService(
                     f"## {signal_emoji} {stock_name} ({result.code})",
                     "",
                 ])
-                signal_excerpt = self._decision_signal_excerpt(result, report_language)
-                if signal_excerpt:
-                    report_lines.extend([signal_excerpt, ""])
-
                 # ========== 舆情与基本面概览（放在最前面）==========
                 intel = dashboard.get('intelligence', {}) if dashboard else {}
                 if intel:
@@ -1459,6 +1543,12 @@ class NotificationService(
                         report_lines.append(f"**🐻 {labels['strongest_bearish_signal_label']}**: {signal_attr['strongest_bearish_signal']}")
                     report_lines.append("")
 
+                # ========== 多策略综合 ==========
+                strategy_synthesis = normalize_strategy_synthesis_payload(
+                    dashboard.get('strategy_synthesis') if dashboard else None
+                )
+                _append_strategy_synthesis_block(report_lines, strategy_synthesis, labels, report_language)
+
                 # 财务摘要 / 股东回报 / 关联板块（数据缺失时自动隐藏对应小节）
                 self._append_fundamental_blocks(report_lines, result)
 
@@ -1488,12 +1578,14 @@ class NotificationService(
                             report_lines.append(f"**{volume_analysis_label}**: {result.volume_analysis}")
                         report_lines.append("")
                     # 消息面
-                    if result.news_summary:
-                        report_lines.extend([
-                            f"### 📰 {news_heading}",
-                            f"{result.news_summary}",
-                            "",
-                        ])
+                    news_disclosure = self._empty_news_disclosure(result, report_language)
+                    if result.news_summary or news_disclosure:
+                        report_lines.append(f"### 📰 {news_heading}")
+                        if news_disclosure:
+                            report_lines.append(news_disclosure)
+                        if result.news_summary:
+                            report_lines.append(f"{result.news_summary}")
+                        report_lines.append("")
 
                 report_lines.extend([
                     "---",
@@ -1566,6 +1658,9 @@ class NotificationService(
                     f"{labels['score_label']} {r.sentiment_score} | "
                     f"{localize_trend_prediction(r.trend_prediction, report_language)}"
                 )
+                news_disclosure = self._empty_news_disclosure(r, report_language)
+                if news_disclosure:
+                    lines.append(news_disclosure)
         else:
             for result in sorted_results:
                 signal_text, signal_emoji, _ = self._get_signal_level(result)
@@ -1586,13 +1681,13 @@ class NotificationService(
                 if one_sentence:
                     lines.append(f"📌 **{one_sentence[:80]}**")
                     lines.append("")
-                signal_excerpt = self._decision_signal_excerpt(result, report_language)
-                if signal_excerpt:
-                    lines.append(signal_excerpt)
-                    lines.append("")
-
                 # 重要信息区（舆情+基本面）
                 info_lines = []
+
+                # 新闻零命中时必须披露，否则企业微信这一路会静默省略
+                news_disclosure = self._empty_news_disclosure(result, report_language)
+                if news_disclosure:
+                    info_lines.append(news_disclosure)
 
                 # 业绩预期
                 if intel.get('earnings_outlook'):
@@ -1651,6 +1746,32 @@ class NotificationService(
                         lines.append(f"🆕 {labels['no_position_label']}: {no_pos[:50]}")
                     if has_pos:
                         lines.append(f"💼 {labels['has_position_label']}: {has_pos[:50]}")
+                    lines.append("")
+
+                # 多策略综合
+                strategy_synthesis = normalize_strategy_synthesis_payload(
+                    dashboard.get('strategy_synthesis') if dashboard else None
+                )
+                if strategy_synthesis:
+                    lines.append(
+                        f"🧩 **{labels['strategy_synthesis_heading']}**: "
+                        f"{localize_strategy_signal(strategy_synthesis.get('final_signal', 'N/A'), report_language)} | "
+                        f"{labels['strategy_consensus_level_label']} "
+                        f"{localize_consensus_level(strategy_synthesis.get('consensus_level', 'N/A'), report_language)} | "
+                        f"{labels['strategy_conflict_label']} "
+                        f"{localize_conflict_severity(strategy_synthesis.get('conflict_severity', 'none'), report_language)}"
+                        f"({strategy_synthesis.get('conflict_count', 0)})"
+                    )
+                    invalid_count = strategy_invalid_opinion_count(strategy_synthesis)
+                    if invalid_count:
+                        lines.append(
+                            labels.get(
+                                'strategy_invalid_opinions_label', ''
+                            ).format(count=invalid_count)
+                        )
+                    summary = localize_strategy_synthesis_summary(strategy_synthesis, report_language)
+                    if summary:
+                        lines.append(summary[:80])
                     lines.append("")
 
                 # 检查清单简化版
@@ -1717,6 +1838,9 @@ class NotificationService(
                 f"{labels['score_label']}:{result.sentiment_score} | "
                 f"{localize_trend_prediction(result.trend_prediction, report_language)}"
             )
+            news_disclosure = self._empty_news_disclosure(result, report_language)
+            if news_disclosure:
+                lines.append(news_disclosure)
 
             # 操作理由（截断）
             if hasattr(result, 'buy_reason') and result.buy_reason:
@@ -1802,6 +1926,9 @@ class NotificationService(
                 f"{signal_text} | "
                 f"{labels['score_label']} {r.sentiment_score} | {one}"
             )
+            news_disclosure = self._empty_news_disclosure(r, report_language)
+            if news_disclosure:
+                lines.append(news_disclosure)
         lines.append("")
         lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         models = self._collect_models_used(results)
@@ -1844,10 +1971,6 @@ class NotificationService(
         if excerpt:
             lines.extend([excerpt, ""])
 
-        signal_excerpt = self._decision_signal_excerpt(result, report_language)
-        if signal_excerpt:
-            lines.extend([signal_excerpt, ""])
-
         self._append_market_snapshot(lines, result)
 
         # 核心决策（一句话）
@@ -1862,6 +1985,12 @@ class NotificationService(
 
         # 重要信息（舆情+基本面）
         info_added = False
+        news_disclosure = self._empty_news_disclosure(result, report_language)
+        if news_disclosure:
+            lines.append(f"### 📰 {labels['info_heading']}")
+            lines.append("")
+            lines.append(news_disclosure)
+            info_added = True
         if intel:
             if intel.get('earnings_outlook'):
                 if not info_added:
@@ -2437,6 +2566,7 @@ class NotificationService(
         route_type: Optional[str] = None,
     ) -> bool:
         use_image = self._should_use_image_for_channel(channel, image_bytes)
+        sanitized_content = strip_hidden_markdown_metadata(content).strip()
         if channel == NotificationChannel.WECHAT:
             if use_image:
                 return self._send_wechat_image(image_bytes)
@@ -2445,12 +2575,12 @@ class NotificationService(
             if getattr(self, "_feishu_send_as_file", False) and route_type == "report":
                 date_str = datetime.now().strftime('%Y%m%d')
                 filepath = self.save_report_to_file(
-                    content, filename=f"report_{date_str}.md"
+                    sanitized_content, filename=f"report_{date_str}.md"
                 )
                 return self.send_feishu_file(filepath)
-            return self.send_to_feishu(content)
+            return self.send_to_feishu(sanitized_content)
         if channel == NotificationChannel.DINGTALK:
-            return self.send_to_dingtalk(content)
+            return self.send_to_dingtalk(sanitized_content)
         if channel == NotificationChannel.TELEGRAM:
             if use_image:
                 return self._send_telegram_photo(image_bytes)
@@ -2463,21 +2593,24 @@ class NotificationService(
                 receivers = self.get_receivers_for_stocks(email_stock_codes)
             if use_image:
                 return self._send_email_with_inline_image(image_bytes, receivers=receivers)
-            return self.send_to_email(content, receivers=receivers)
+            return self.send_to_email(
+                sanitized_content,
+                receivers=receivers,
+            )
         if channel == NotificationChannel.PUSHOVER:
             return self.send_to_pushover(content)
         if channel == NotificationChannel.NTFY:
-            return self.send_to_ntfy(content)
+            return self.send_to_ntfy(sanitized_content)
         if channel == NotificationChannel.GOTIFY:
-            return self.send_to_gotify(content)
+            return self.send_to_gotify(sanitized_content)
         if channel == NotificationChannel.PUSHPLUS:
-            return self.send_to_pushplus(content)
+            return self.send_to_pushplus(sanitized_content)
         if channel == NotificationChannel.SERVERCHAN3:
-            return self.send_to_serverchan3(content)
+            return self.send_to_serverchan3(sanitized_content)
         if channel == NotificationChannel.CUSTOM:
             if use_image:
                 return self._send_custom_webhook_image(image_bytes, fallback_content=content)
-            return self.send_to_custom(content)
+            return self.send_to_custom(sanitized_content)
         if channel == NotificationChannel.DISCORD:
             return self.send_to_discord(content)
         if channel == NotificationChannel.SLACK:
@@ -2485,7 +2618,7 @@ class NotificationService(
                 return self._send_slack_image(image_bytes, fallback_content=content)
             return self.send_to_slack(content)
         if channel == NotificationChannel.ASTRBOT:
-            return self.send_to_astrbot(content)
+            return self.send_to_astrbot(sanitized_content)
         logger.warning(f"不支持的通知渠道: {channel}")
         return False
 
@@ -2498,6 +2631,7 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        structured_payload: Optional[Dict[str, Any]] = None,
     ) -> NotificationDispatchResult:
         """
         Send a notification and return per-channel diagnostics.
@@ -2518,6 +2652,7 @@ class NotificationService(
             severity: 通知严重级别；未设置时按路由类型推断
             dedup_key: 可选稳定去重 key；未设置时使用内容 hash
             cooldown_key: 可选冷却 key；未设置时使用路由/级别默认 key
+            structured_payload: 可选的个股或市场结构化结果，仅用于图片模板精确填充
 
         Returns:
             Structured dispatch diagnostics.
@@ -2613,7 +2748,9 @@ class NotificationService(
         if channels_needing_image:
             from src.md2img import markdown_to_image
             image_bytes = markdown_to_image(
-                content, max_chars=self._markdown_to_image_max_chars
+                content,
+                max_chars=self._markdown_to_image_max_chars,
+                structured_payload=structured_payload,
             )
             if image_bytes:
                 logger.info("Markdown 已转换为图片，将向 %s 发送图片",
@@ -2712,6 +2849,7 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
+        structured_payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
         统一发送接口 - 向所有已配置的渠道发送。
@@ -2727,6 +2865,7 @@ class NotificationService(
             severity=severity,
             dedup_key=dedup_key,
             cooldown_key=cooldown_key,
+            structured_payload=structured_payload,
         )
         return bool(result.success)
 
@@ -2781,7 +2920,10 @@ class NotificationService(
         Returns:
             Whether the Feishu file upload succeeded.
         """
-        filepath = self.save_report_to_file(content, filename=filename)
+        filepath = self.save_report_to_file(
+            strip_hidden_markdown_metadata(content).strip(),
+            filename=filename,
+        )
         logger.info("将上传文件到飞书: %s", filepath)
         return self.send_feishu_file(filepath)
 

@@ -8,9 +8,11 @@ without importing the full ReAct loop.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -18,6 +20,39 @@ from typing import Any, Dict, Iterable, List, Optional
 from src.agent.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Cooperative cancellation signal (best-effort timeouts, Issue #1890 / review)
+# ---------------------------------------------------------------------------
+# Python cannot forcibly stop an already-started tool thread, so when a tool
+# times out its handler may keep running in the background.  To give long or
+# side-effecting handlers a way to honour the timeout, the runner arms a
+# per-call ``threading.Event`` on timeout and publishes it through this
+# contextvar for the duration of the call.  Handlers MAY poll
+# ``is_tool_cancellation_requested`` and abort early; the same signal is also
+# honoured by the existing ``check_tool_execution()`` checkpoint that data /
+# backtest / tool-surface handlers already call, so a timed-out handler stops at
+# its next safe boundary even without opting into the helper.  The signal is
+# strictly opt-in by checkpoint: handlers that never call either are completely
+# unaffected, and the runner only sets the event after a timeout has already
+# fired — never during normal completion.  This is the "in-handler cooperative
+# cancel" mitigation requested in review, layered on top of the non-retriable
+# cache (which blocks the LLM from re-launching the same call).
+TOOL_CANCEL_EVENT: "contextvars.ContextVar[Optional[threading.Event]]" = contextvars.ContextVar(
+    "tool_cancel_event", default=None
+)
+
+
+def is_tool_cancellation_requested() -> bool:
+    """Return True when the current tool call has been asked to cancel.
+
+    Tool handlers may call this cheaply inside long loops or before performing
+    an irreversible side effect, to honour a best-effort timeout.  Returns False
+    unless the runner has armed the cancellation event for the running call.
+    """
+    event = TOOL_CANCEL_EVENT.get()
+    return event is not None and event.is_set()
+
 
 _SUMMARY_LIMIT = 500
 _TOKEN_PATTERN = re.compile(
@@ -64,8 +99,54 @@ class ToolAccessContext:
     backend: Optional[str] = None
     session_id: Optional[str] = None
     timeout_seconds: Optional[float] = None
+    deadline: Optional[float] = None
+    cancel_event: Optional[threading.Event] = None
     max_result_bytes: Optional[int] = None
+    redact_result: bool = False
     audit_context: Dict[str, Any] = field(default_factory=dict)
+
+
+class ToolExecutionCancelled(Exception):
+    """Raised at a cooperative checkpoint after the caller cancels a tool."""
+
+
+class ToolExecutionDeadlineExceeded(Exception):
+    """Raised at a cooperative checkpoint after the tool deadline expires."""
+
+
+_ACTIVE_TOOL_CONTEXT: contextvars.ContextVar[Optional[ToolAccessContext]] = contextvars.ContextVar(
+    "active_tool_access_context",
+    default=None,
+)
+
+
+def bind_tool_execution_context(context: ToolAccessContext) -> contextvars.Token:
+    """Bind one Tool Surface execution context for runtime-neutral handlers."""
+    return _ACTIVE_TOOL_CONTEXT.set(context)
+
+
+def reset_tool_execution_context(token: contextvars.Token) -> None:
+    """Restore the previous Tool Surface execution context."""
+    _ACTIVE_TOOL_CONTEXT.reset(token)
+
+
+def check_tool_execution() -> None:
+    """Stop at a safe handler boundary when cancellation or deadline is reached."""
+    context = _ACTIVE_TOOL_CONTEXT.get()
+    if context is not None:
+        if context.cancel_event is not None and context.cancel_event.is_set():
+            raise ToolExecutionCancelled("Tool execution was cancelled")
+        if context.deadline is not None and time.monotonic() >= context.deadline:
+            raise ToolExecutionDeadlineExceeded("Tool execution deadline was exceeded")
+    # Runner-armed cooperative cancel (Issue #1890): when a per-tool timeout
+    # fires, the runner arms ``TOOL_CANCEL_EVENT`` for the running call.  Real
+    # tool handlers (data/backtest/tool-surface) poll this checkpoint rather than
+    # the opt-in ``is_tool_cancellation_requested()`` helper, so honour the signal
+    # here too — a still-running handler then aborts before its next side-effecting
+    # step instead of running to completion in the background thread.
+    cancel_event = TOOL_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        raise ToolExecutionCancelled("Tool execution timed out (cooperative cancel)")
 
 
 def serialize_tool_result(result: Any) -> str:
@@ -243,6 +324,20 @@ def _redact_json_string_if_possible(text: str) -> str:
         return json.dumps(_redact_structured_secrets(parsed), ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return text
+
+
+def redact_external_tool_result(result: Any) -> str:
+    """Serialize and redact a ToolSurface result before external roundtrip."""
+    if isinstance(result, (dict, list, tuple)):
+        try:
+            text = json.dumps(_redact_structured_secrets(result), ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = serialize_tool_result(result)
+    elif isinstance(result, str):
+        text = _redact_json_string_if_possible(result)
+    else:
+        text = serialize_tool_result(result)
+    return redact_diagnostic_value(text, limit=max(len(text), 1))
 
 
 def execute_runner_tool_call(
